@@ -6,14 +6,64 @@ Helper functions for dataset management, validation, and preparation.
 """
 
 import os
+import glob
 import yaml
 import shutil
 from pathlib import Path
 from collections import defaultdict
 
 
+def detect_class_names(dataset_path: str) -> list:
+    """
+    Auto-detect class names from dataset.
+    
+    Args:
+        dataset_path: Path to dataset directory
+        
+    Returns:
+        List of detected class names
+    """
+    classes = []
+    
+    # Method 1: Look for classes.txt or names.txt
+    for filename in ['classes.txt', 'names.txt', 'class_names.txt']:
+        class_file = os.path.join(dataset_path, filename)
+        if os.path.exists(class_file):
+            with open(class_file, 'r') as f:
+                classes = [line.strip() for line in f.readlines() if line.strip()]
+            print(f"📝 Found class names in {filename}: {classes}")
+            return classes
+    
+    # Method 2: Look in train/labels directory for class indices
+    for labels_subdir in ['train/labels', 'train']:
+        labels_dir = os.path.join(dataset_path, labels_subdir)
+        if os.path.exists(labels_dir):
+            label_files = glob.glob(os.path.join(labels_dir, '*.txt'))
+            class_indices = set()
+            
+            for label_file in label_files[:10]:  # Check first 10 files
+                try:
+                    with open(label_file, 'r') as f:
+                        for line in f:
+                            if line.strip():
+                                class_idx = int(line.split()[0])
+                                class_indices.add(class_idx)
+                except (ValueError, IndexError):
+                    continue
+            
+            if class_indices:
+                max_class = max(class_indices)
+                classes = [f'class_{i}' for i in range(max_class + 1)]
+                print(f"🔍 Detected {len(classes)} classes from label files: {sorted(class_indices)}")
+                return classes
+    
+    # Method 3: Default fallback for CADI AI
+    print("⚠️ Could not detect class names, using CADI AI defaults")
+    return ['abiotic', 'disease', 'insect']
+
+
 def create_data_yaml(dataset_path: str, output_path: str = "data.yaml", 
-                    class_names: list = None) -> str:
+                    class_names: list = None, cache_dir: str = None) -> str:
     """
     Create a data.yaml file for YOLO training.
     
@@ -21,33 +71,69 @@ def create_data_yaml(dataset_path: str, output_path: str = "data.yaml",
         dataset_path: Path to dataset directory containing train/val/test folders
         output_path: Where to save the data.yaml file
         class_names: List of class names (if None, will try to detect from dataset)
+        cache_dir: Directory for cache files (if None, will use writable location)
     
     Returns:
         Path to created data.yaml file
     """
     
-    # Default class names for CADI AI
+    # Auto-detect class names if not provided
     if class_names is None:
-        class_names = ['abiotic', 'disease', 'insect']
+        class_names = detect_class_names(dataset_path)
     
     # Check if dataset path exists
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset path not found: {dataset_path}")
     
+    # Setup cache directory for writable storage
+    if cache_dir is None:
+        # Use writable cache directory
+        cache_dir = os.path.join(os.path.dirname(output_path), 'cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    
     # Build data configuration
     data_config = {
-        'train': f'{dataset_path}/train/images',
-        'val': f'{dataset_path}/valid/images',
-        'test': f'{dataset_path}/test/images',
+        'path': dataset_path,  # Root directory of dataset
+        'train': f'{dataset_path}/train',
+        'val': f'{dataset_path}/valid',
+        'test': f'{dataset_path}/test',
         'nc': len(class_names),
         'names': class_names
     }
     
-    # Verify paths exist
+    # Add cache configuration for writable storage
+    if '/kaggle/input' in dataset_path or not os.access(dataset_path, os.W_OK):
+        # If dataset is in read-only location, configure cache elsewhere
+        data_config['cache'] = False  # Disable automatic caching
+        print(f"⚠️  Dataset in read-only location, caching disabled")
+    else:
+        # Dataset is writable, can use normal caching
+        data_config['cache'] = True
+    
+    # Verify paths exist and adjust if needed
     missing_paths = []
-    for split, path in [('train', data_config['train']), ('val', data_config['val'])]:
-        if not os.path.exists(path):
-            missing_paths.append(f"{split}: {path}")
+    for split in ['train', 'val']:
+        # Try both direct path and path/images structure
+        direct_path = f'{dataset_path}/{split}'
+        images_path = f'{dataset_path}/{split}/images'
+        
+        if os.path.exists(images_path):
+            data_config[split] = images_path
+        elif os.path.exists(direct_path):
+            data_config[split] = direct_path
+        else:
+            missing_paths.append(f"{split}: {direct_path} or {images_path}")
+    
+    # Handle test split (optional)
+    test_direct = f'{dataset_path}/test'
+    test_images = f'{dataset_path}/test/images'
+    if os.path.exists(test_images):
+        data_config['test'] = test_images
+    elif os.path.exists(test_direct):
+        data_config['test'] = test_direct
+    else:
+        # Remove test if it doesn't exist
+        data_config.pop('test', None)
     
     if missing_paths:
         print("⚠️  Warning: Some paths don't exist:")
@@ -226,6 +312,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='CADI AI Dataset Utilities')
     parser.add_argument('--create-yaml', help='Create data.yaml for dataset path')
     parser.add_argument('--output-path', help='Output path for the generated data.yaml', default='data.yaml')
+    parser.add_argument('--cache-dir', help='Directory for cache files')
     parser.add_argument('--validate', help='Validate dataset from data.yaml')
     parser.add_argument('--setup-kaggle', nargs=2, metavar=('DATASET_PATH', 'WORKING_DIR'),
                         help='Setup Kaggle dataset')
@@ -233,7 +320,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.create_yaml:
-        create_data_yaml(args.create_yaml, args.output_path)
+        create_data_yaml(args.create_yaml, args.output_path, cache_dir=args.cache_dir)
     elif args.validate:
         validate_dataset(args.validate)
     elif args.setup_kaggle:
