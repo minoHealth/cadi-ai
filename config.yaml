@@ -14,6 +14,7 @@ imgsz: 640
 batch: "auto"  # Use "auto" for automatic batch size detection, or specify a number (e.g., 16)
 device: 0  # GPU device (0 for first GPU, "cpu" for CPU)
 workers: 8  # Number of data loading workers
+cache: false  # Disable cache to avoid read-only directory issues
 
 # Training Behavior
 patience: 50  # Early stopping patience (epochs without improvement)
