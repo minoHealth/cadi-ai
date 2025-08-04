@@ -79,7 +79,8 @@ class ModelTrainer:
                     patience=0,
                     verbose=False,
                     plots=False,
-                    save=False
+                    save=False,
+                    cache=False  # Explicitly disable cache for batch size testing
                 )
                 
                 print(f"✅ Batch size {batch} works!")
@@ -158,7 +159,8 @@ class ModelTrainer:
                 val=self.config.get('val', True),
                 project=self.config.get('output_dir', 'runs'),
                 name=self.config.get('name', 'train'),
-                exist_ok=True
+                exist_ok=True,
+                cache=self.config.get('cache', False)  # Explicitly set cache parameter
             )
             
             print("✅ Training completed successfully!")
