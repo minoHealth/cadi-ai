@@ -53,9 +53,16 @@ def detect_class_names(dataset_path: str) -> list:
             
             if class_indices:
                 max_class = max(class_indices)
-                classes = [f'class_{i}' for i in range(max_class + 1)]
-                print(f"🔍 Detected {len(classes)} classes from label files: {sorted(class_indices)}")
-                return classes
+                # Use CADI AI class names if we detect the expected number of classes
+                if max_class + 1 == 3:
+                    classes = ['abiotic', 'disease', 'insect']
+                    print(f"🔍 Detected 3 classes from label files: {sorted(class_indices)}")
+                    print(f"🎯 Using CADI AI class names: {classes}")
+                    return classes
+                else:
+                    classes = [f'class_{i}' for i in range(max_class + 1)]
+                    print(f"🔍 Detected {len(classes)} classes from label files: {sorted(class_indices)}")
+                    return classes
     
     # Method 3: Default fallback for CADI AI
     print("⚠️ Could not detect class names, using CADI AI defaults")
@@ -113,25 +120,45 @@ def create_data_yaml(dataset_path: str, output_path: str = "data.yaml",
     # Verify paths exist and adjust if needed
     missing_paths = []
     for split in ['train', 'val']:
-        # Try both direct path and path/images structure
-        direct_path = f'{dataset_path}/{split}'
-        images_path = f'{dataset_path}/{split}/images'
-        
-        if os.path.exists(images_path):
-            data_config[split] = images_path
-        elif os.path.exists(direct_path):
-            data_config[split] = direct_path
+        # Try multiple naming conventions for validation split
+        if split == 'val':
+            possible_names = ['val', 'valid', 'validation']
         else:
-            missing_paths.append(f"{split}: {direct_path} or {images_path}")
+            possible_names = [split]
+        
+        found_path = None
+        for name in possible_names:
+            # Try both direct path and path/images structure
+            direct_path = f'{dataset_path}/{name}'
+            images_path = f'{dataset_path}/{name}/images'
+            
+            if os.path.exists(images_path):
+                found_path = images_path
+                break
+            elif os.path.exists(direct_path):
+                found_path = direct_path
+                break
+        
+        if found_path:
+            data_config[split] = found_path
+        else:
+            missing_paths.append(f"{split}: No valid path found (tried {possible_names})")
     
     # Handle test split (optional)
-    test_direct = f'{dataset_path}/test'
-    test_images = f'{dataset_path}/test/images'
-    if os.path.exists(test_images):
-        data_config['test'] = test_images
-    elif os.path.exists(test_direct):
-        data_config['test'] = test_direct
-    else:
+    test_found = False
+    for test_name in ['test', 'testing']:
+        test_direct = f'{dataset_path}/{test_name}'
+        test_images = f'{dataset_path}/{test_name}/images'
+        if os.path.exists(test_images):
+            data_config['test'] = test_images
+            test_found = True
+            break
+        elif os.path.exists(test_direct):
+            data_config['test'] = test_direct
+            test_found = True
+            break
+    
+    if not test_found:
         # Remove test if it doesn't exist
         data_config.pop('test', None)
     
@@ -178,7 +205,20 @@ def validate_dataset(data_yaml_path: str) -> dict:
     for split in ['train', 'val', 'test']:
         if split in data_config:
             image_path = data_config[split]
-            label_path = image_path.replace('/images', '/labels')
+            
+            # Smart label path detection
+            if '/images' in image_path:
+                label_path = image_path.replace('/images', '/labels')
+            else:
+                # If no /images in path, assume labels are in parallel directory
+                label_path = f"{image_path.rstrip('/')}_labels"
+                if not os.path.exists(label_path):
+                    # Try labels subdirectory
+                    label_path = f"{image_path}/labels"
+                if not os.path.exists(label_path):
+                    # Try parent directory with labels
+                    parent_dir = os.path.dirname(image_path)
+                    label_path = f"{parent_dir}/labels"
             
             # Count images and labels
             if os.path.exists(image_path):
