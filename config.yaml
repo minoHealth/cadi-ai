@@ -17,7 +17,7 @@ workers: 8  # Number of data loading workers
 cache: false  # Disable cache to avoid read-only directory issues
 
 # Training Behavior
-patience: 50  # Early stopping patience (epochs without improvement)
+patience: 20  # Early stopping patience (epochs without improvement)
 save: true    # Save training checkpoints
 plots: true   # Generate training plots
 val: true     # Run validation during training
