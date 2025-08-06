@@ -44,6 +44,62 @@ class ModelTrainer:
         """Create necessary output directories."""
         os.makedirs(self.config.get('output_dir', 'runs'), exist_ok=True)
         
+    def find_resume_checkpoint(self, resume_path: str = None) -> str:
+        """
+        Find the most recent checkpoint for resuming training.
+        
+        Args:
+            resume_path: Specific path to checkpoint, or None to auto-detect
+            
+        Returns:
+            Path to checkpoint file, or None if not found
+        """
+        if resume_path and resume_path != "auto":
+            # Use specific checkpoint path
+            if os.path.exists(resume_path):
+                print(f"📂 Using specified checkpoint: {resume_path}")
+                return resume_path
+            else:
+                raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
+        
+        # Auto-detect latest checkpoint
+        output_dir = self.config.get('output_dir', 'runs')
+        experiment_name = self.config.get('name', 'train')
+        
+        # Look for checkpoints in the expected location
+        possible_paths = [
+            f"{output_dir}/{experiment_name}/weights/last.pt",
+            f"{output_dir}/detect/{experiment_name}/weights/last.pt",
+            f"runs/{experiment_name}/weights/last.pt",
+            f"runs/detect/{experiment_name}/weights/last.pt",
+        ]
+        
+        # Also search for any recent training runs
+        import glob
+        search_patterns = [
+            f"{output_dir}/**/weights/last.pt",
+            f"runs/**/weights/last.pt"
+        ]
+        
+        all_checkpoints = []
+        for pattern in search_patterns:
+            all_checkpoints.extend(glob.glob(pattern, recursive=True))
+        
+        if all_checkpoints:
+            # Sort by modification time, most recent first
+            all_checkpoints.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            latest_checkpoint = all_checkpoints[0]
+            print(f"🔄 Auto-detected latest checkpoint: {latest_checkpoint}")
+            
+            # Show checkpoint info
+            import time
+            mod_time = os.path.getmtime(latest_checkpoint)
+            print(f"   📅 Last modified: {time.ctime(mod_time)}")
+            
+            return latest_checkpoint
+        
+        return None
+        
     def find_optimal_batch_size(self, max_batch: int = 32, min_batch: int = 2) -> int:
         """
         Dynamically find the largest batch size that fits in memory.
@@ -120,7 +176,7 @@ class ModelTrainer:
         
         raise RuntimeError(f"No suitable batch size found (tried down to {min_batch})")
     
-    def train(self):
+    def train(self, resume_checkpoint: str = None):
         """Main training function."""
         try:
             print("🚀 Starting CADI AI Model Training")
@@ -129,20 +185,34 @@ class ModelTrainer:
             # Print system info
             self.print_system_info()
             
+            # Check for resume
+            model_path = self.config['model']
+            if resume_checkpoint:
+                checkpoint_path = self.find_resume_checkpoint(resume_checkpoint)
+                if checkpoint_path:
+                    model_path = checkpoint_path
+                    print(f"🔄 Resuming training from checkpoint: {checkpoint_path}")
+                else:
+                    print("⚠️  No checkpoint found, starting fresh training")
+            
             # Validate data paths
             self.validate_data_paths()
             
-            # Find optimal batch size if not specified
+            # Find optimal batch size if not specified (and not resuming)
             if 'batch' not in self.config or self.config['batch'] == 'auto':
-                optimal_batch = self.find_optimal_batch_size()
-                self.config['batch'] = optimal_batch
-                print(f"🎯 Using optimal batch size: {optimal_batch}")
+                if not resume_checkpoint:
+                    optimal_batch = self.find_optimal_batch_size()
+                    self.config['batch'] = optimal_batch
+                    print(f"🎯 Using optimal batch size: {optimal_batch}")
+                else:
+                    # When resuming, batch size is preserved from checkpoint
+                    print("📦 Batch size will be restored from checkpoint")
             else:
                 print(f"📦 Using configured batch size: {self.config['batch']}")
             
             # Initialize model
-            print(f"🤖 Loading model: {self.config['model']}")
-            model = YOLO(self.config['model'])
+            print(f"🤖 Loading model: {model_path}")
+            model = YOLO(model_path)
             
             # Start training
             print("🏋️ Starting training...")
@@ -216,6 +286,7 @@ def main():
     parser.add_argument('--config', '-c', required=True, help='Path to config YAML file')
     parser.add_argument('--batch', '-b', type=int, help='Override batch size from config')
     parser.add_argument('--epochs', '-e', type=int, help='Override epochs from config')
+    parser.add_argument('--resume', '-r', help='Resume training from checkpoint (path to last.pt or auto-detect)')
     parser.add_argument('--find-batch', action='store_true', help='Find optimal batch size and exit')
     parser.add_argument('--validate-paths-only', action='store_true', help='Validate data paths and exit')
 
@@ -242,13 +313,10 @@ def main():
             print("Finding optimal batch size...")
             optimal_batch = trainer.find_optimal_batch_size()
             print(f"✅ Optimal batch size found: {optimal_batch}")
-            # Optionally, update config on disk
-            # with open(args.config, 'w') as f:
-            #     yaml.dump(trainer.config, f)
             sys.exit(0)
             
-        # Start training
-        results = trainer.train()
+        # Start training (with resume if specified)
+        results = trainer.train(resume_checkpoint=args.resume)
         
         print("🎉 Training pipeline completed successfully!")
         
