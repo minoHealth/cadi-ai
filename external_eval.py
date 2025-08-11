@@ -231,6 +231,8 @@ def prediction_diagnostics(
     If external_val is provided, create a temporary data.yaml with its val path and
     run YOLO validation into an isolated subfolder under the evaluation output dir.
     """
+    # Ensure output directory exists (prevents FileNotFoundError for temp yaml)
+    output_dir.mkdir(parents=True, exist_ok=True)
     data_cfg = read_yaml(data_yaml)
     class_names = data_cfg.get('names') or []
     idx_lookup = {c: i for i, c in enumerate(class_names)}
@@ -285,7 +287,13 @@ def prediction_diagnostics(
 
     image_files: List[Path] = []
     if val_root.is_dir():
-        for ext in ('*.jpg', '*.jpeg', '*.png'):
+        # Support broader extension set via env or default
+        exts_env = os.environ.get('CADI_IMG_EXTS')
+        if exts_env:
+            patterns = [e.strip() for e in exts_env.split(',') if e.strip()]
+        else:
+            patterns = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
+        for ext in patterns:
             image_files.extend(val_root.rglob(ext))
     elif val_root.suffix == '.txt':  # list file
         try:
@@ -296,11 +304,17 @@ def prediction_diagnostics(
     if limit and len(image_files) > limit:
         image_files = image_files[:limit]
 
-    # Build label paths
-    label_files = [
-        Path(str(p).replace('/images/', '/labels/').replace('\\images\\', '\\labels\\'))
-        .with_suffix('.txt') for p in image_files
-    ]
+    # Build label paths with fallback
+    label_files: List[Path] = []
+    for p in image_files:
+        primary = Path(str(p).replace('/images/', '/labels/').replace('\\images\\', '\\labels\\')).with_suffix('.txt')
+        if primary.exists():
+            label_files.append(primary)
+            continue
+        alt = p.parent.parent / 'labels' / (p.stem + '.txt') if p.parent.parent.exists() else primary
+        label_files.append(alt)
+    total_images_found = len(image_files)
+    images_with_target = 0
 
     for cls in target_classes:
         (output_dir / f'missed_{cls}').mkdir(parents=True, exist_ok=True)
@@ -336,8 +350,9 @@ def prediction_diagnostics(
                 if cid < len(class_names):
                     x, y, w, h = map(float, ps[1:5])
                     gt_objs.append({'cid': cid, 'bbox': (x, y, w, h)})
-        if not any(o['cid'] in indices for o in gt_objs):
+    if not any(o['cid'] in indices for o in gt_objs):
             continue
+    images_with_target += 1
 
         # run inference
         try:
@@ -411,7 +426,12 @@ def prediction_diagnostics(
     rates = {c: (success[c] / total[c]) if total[c] else 0.0 for c in target_classes}
     _plot_detection_rates(rates, output_dir, conf)
     _write_detection_summary(rates, success, total, output_dir)
-    return {'rates': rates, 'success': success, 'total': total, 'tp_confidences': tp_conf}
+    meta = {
+        'num_images_scanned': total_images_found,
+        'num_images_with_target_labels': images_with_target,
+        'object_instances_processed': sum(total.values())
+    }
+    return {'rates': rates, 'success': success, 'total': total, 'tp_confidences': tp_conf, 'meta': meta}
 
 
 def _save_prediction_ckpt(path: Path, success: Dict[str, int], total: Dict[str, int], processed: int):
