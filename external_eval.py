@@ -668,7 +668,7 @@ def main():
     if problematic and external_diag:
         for cls in problematic:
             side_by_side[cls] = {
-                'internal_rate': internal_diag['rates'].get(cls, 0.0),
+                'internal_rate': internal_rates.get(cls, 0.0),
                 'external_rate': external_diag['rates'].get(cls, 0.0),
                 'threshold_rec': thresholds.get(cls)
             }
