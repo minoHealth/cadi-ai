@@ -547,6 +547,8 @@ def parse_args():
     p.add_argument('--output-dir', default=None, help='Explicit output directory (otherwise auto under WORKING_DIR/eval)')
     p.add_argument('--external-val', default=None, help='External validation path (directory or list file) used only for diagnostics; does NOT modify data.yaml')
     p.add_argument('--eval-dir-name', default='open_cadi_eval', help='Base folder name under WORKING_DIR for evaluation outputs (timestamp subfolder added)')
+    p.add_argument('--threshold-recall-target', type=float, default=0.85, help='Target recall quantile (0-1) for per-class threshold recommendation.')
+    p.add_argument('--external-only', action='store_true', help='Skip internal validation diagnostics and run ONLY on --external-val dataset.')
     return p.parse_args()
 
 
@@ -600,23 +602,38 @@ def main():
     internal_diag: Dict = {}
     external_diag: Dict = {}
     thresholds: Dict[str, float] = {}
+    target_recall = getattr(args, 'threshold_recall_target', 0.85)
     if problematic:
         log(f"Problematic classes: {problematic}")
-        internal_diag = prediction_diagnostics(
-            model, data_yaml, problematic, output_dir / 'internal',
-            conf=args.conf, limit=args.limit, min_iou=args.min_iou,
-            overlap_thresh=args.overlap_thresh, resume=resume, batch=args.batch, external_val=None)
-        thresholds = recommend_thresholds(internal_diag['tp_confidences'], args.threshold_recall_target)
-        if args.external_val:
+        # External-only mode
+        if args.external_only and args.external_val:
             ext_path = Path(args.external_val).resolve()
-            if ext_path.exists():
+            if not ext_path.exists():
+                log(f"ERROR: --external-only specified but external path {ext_path} missing; falling back to internal.")
+            else:
                 external_diag = prediction_diagnostics(
                     model, data_yaml, problematic, output_dir / 'external',
                     conf=args.conf, limit=args.limit, min_iou=args.min_iou,
                     overlap_thresh=args.overlap_thresh, resume=resume, batch=args.batch, external_val=ext_path)
-            else:
-                log(f"WARNING: external validation path {ext_path} does not exist; skipping external diagnostics.")
-        log('Prediction diagnostics complete (internal + optional external).')
+                thresholds = recommend_thresholds(external_diag['tp_confidences'], target_recall)
+                log('External-only diagnostics complete.')
+        # Standard dual-mode
+        if not external_diag:  # run internal if not external-only success
+            internal_diag = prediction_diagnostics(
+                model, data_yaml, problematic, output_dir / 'internal',
+                conf=args.conf, limit=args.limit, min_iou=args.min_iou,
+                overlap_thresh=args.overlap_thresh, resume=resume, batch=args.batch, external_val=None)
+            thresholds = recommend_thresholds(internal_diag['tp_confidences'], target_recall)
+            if args.external_val:
+                ext_path = Path(args.external_val).resolve()
+                if ext_path.exists():
+                    external_diag = prediction_diagnostics(
+                        model, data_yaml, problematic, output_dir / 'external',
+                        conf=args.conf, limit=args.limit, min_iou=args.min_iou,
+                        overlap_thresh=args.overlap_thresh, resume=resume, batch=args.batch, external_val=ext_path)
+                else:
+                    log(f"WARNING: external validation path {ext_path} does not exist; skipping external diagnostics.")
+            log('Prediction diagnostics complete (internal + optional external).')
     else:
         log('No problematic classes determined; skipping diagnostics.')
 
@@ -634,6 +651,8 @@ def main():
                 'external_rate': external_diag['rates'].get(cls, 0.0),
                 'threshold_rec': thresholds.get(cls)
             }
+    # Choose alias for backward compatibility (internal preferred; else external)
+    detection_rates_alias = internal_rates if internal_rates else (external_diag.get('rates', {}) if external_diag else {})
     report = {
         'timestamp_utc': timestamp,
         'environment': env,
@@ -652,6 +671,8 @@ def main():
         'args': vars(args),
         'external_val_used': args.external_val is not None,
         'external_val_path': args.external_val,
+        # backward compatibility field name
+        'detection_rates': detection_rates_alias,
     }
     (output_dir / 'analysis_report.json').write_text(json.dumps(report, indent=2))
     log('Report written (analysis_report.json).')
@@ -660,7 +681,7 @@ def main():
     log(f"Problematic classes: {problematic}")
     if internal_diag: log(f"Internal detection rates: {internal_diag['rates']}")
     if external_diag: log(f"External detection rates: {external_diag['rates']}")
-    if thresholds: log(f"Per-class threshold recommendations (target recall {args.threshold_recall_target}): {thresholds}")
+    if thresholds: log(f"Per-class threshold recommendations (target recall {target_recall}): {thresholds}")
     if recs:
         log('Recommendations:')
         for r in recs:
