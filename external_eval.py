@@ -17,7 +17,7 @@ CLI example:
 
 from __future__ import annotations
 
-import argparse, json, os, sys
+import argparse, json, os, sys, traceback
 from datetime import datetime
 from glob import glob
 from pathlib import Path
@@ -225,6 +225,7 @@ def prediction_diagnostics(
     batch: int = 16,
     external_val: Path | None = None,
     collect_tp_conf: bool = True,
+    image_patterns: List[str] | None = None,
 ) -> Dict[str, Dict]:
     """Run validation & per-image diagnostics.
 
@@ -287,14 +288,20 @@ def prediction_diagnostics(
 
     image_files: List[Path] = []
     if val_root.is_dir():
-        # Support broader extension set via env or default
-        exts_env = os.environ.get('CADI_IMG_EXTS')
-        if exts_env:
-            patterns = [e.strip() for e in exts_env.split(',') if e.strip()]
+        # Support broader extension set via CLI / env / defaults
+        if image_patterns:
+            patterns = image_patterns
         else:
-            patterns = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
+            exts_env = os.environ.get('CADI_IMG_EXTS')
+            if exts_env:
+                patterns = [e.strip() for e in exts_env.split(',') if e.strip()]
+            else:
+                patterns = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG', '*.webp', '*.WEBP', '*.tif', '*.tiff', '*.TIF', '*.TIFF', '*.bmp', '*.BMP']
         for ext in patterns:
-            image_files.extend(val_root.rglob(ext))
+            try:
+                image_files.extend(val_root.rglob(ext))
+            except Exception:
+                pass
     elif val_root.suffix == '.txt':  # list file
         try:
             lines = val_root.read_text().strip().splitlines()
@@ -569,6 +576,7 @@ def parse_args():
     p.add_argument('--eval-dir-name', default='open_cadi_eval', help='Base folder name under WORKING_DIR for evaluation outputs (timestamp subfolder added)')
     p.add_argument('--threshold-recall-target', type=float, default=0.85, help='Target recall quantile (0-1) for per-class threshold recommendation.')
     p.add_argument('--external-only', action='store_true', help='Skip internal validation diagnostics and run ONLY on --external-val dataset.')
+    p.add_argument('--img-exts', default=None, help='Comma-separated list of glob patterns for image files (e.g. "*.jpg,*.png,*.jpeg,*.webp"). Overrides env CADI_IMG_EXTS.')
     return p.parse_args()
 
 
@@ -623,6 +631,11 @@ def main():
     external_diag: Dict = {}
     thresholds: Dict[str, float] = {}
     target_recall = getattr(args, 'threshold_recall_target', 0.85)
+    # Prepare image extension patterns
+    img_patterns: List[str] | None = None
+    if getattr(args, 'img_exts', None):
+        img_patterns = [e.strip() for e in args.img_exts.split(',') if e.strip()]
+
     if problematic:
         log(f"Problematic classes: {problematic}")
         # External-only mode
@@ -634,7 +647,7 @@ def main():
                 external_diag = prediction_diagnostics(
                     model, data_yaml, problematic, output_dir / 'external',
                     conf=args.conf, limit=args.limit, min_iou=args.min_iou,
-                    overlap_thresh=args.overlap_thresh, resume=resume, batch=args.batch, external_val=ext_path)
+                    overlap_thresh=args.overlap_thresh, resume=resume, batch=args.batch, external_val=ext_path, image_patterns=img_patterns)
                 thresholds = recommend_thresholds(external_diag['tp_confidences'], target_recall)
                 log('External-only diagnostics complete.')
         # Standard dual-mode
@@ -642,7 +655,7 @@ def main():
             internal_diag = prediction_diagnostics(
                 model, data_yaml, problematic, output_dir / 'internal',
                 conf=args.conf, limit=args.limit, min_iou=args.min_iou,
-                overlap_thresh=args.overlap_thresh, resume=resume, batch=args.batch, external_val=None)
+                overlap_thresh=args.overlap_thresh, resume=resume, batch=args.batch, external_val=None, image_patterns=img_patterns)
             thresholds = recommend_thresholds(internal_diag['tp_confidences'], target_recall)
             if args.external_val:
                 ext_path = Path(args.external_val).resolve()
@@ -650,7 +663,7 @@ def main():
                     external_diag = prediction_diagnostics(
                         model, data_yaml, problematic, output_dir / 'external',
                         conf=args.conf, limit=args.limit, min_iou=args.min_iou,
-                        overlap_thresh=args.overlap_thresh, resume=resume, batch=args.batch, external_val=ext_path)
+                        overlap_thresh=args.overlap_thresh, resume=resume, batch=args.batch, external_val=ext_path, image_patterns=img_patterns)
                 else:
                     log(f"WARNING: external validation path {ext_path} does not exist; skipping external diagnostics.")
             log('Prediction diagnostics complete (internal + optional external).')
@@ -691,6 +704,8 @@ def main():
         'args': vars(args),
         'external_val_used': args.external_val is not None,
         'external_val_path': args.external_val,
+        'internal_meta': internal_diag.get('meta') if internal_diag else {},
+        'external_meta': external_diag.get('meta') if external_diag else {},
         # backward compatibility field name
         'detection_rates': detection_rates_alias,
     }
@@ -717,7 +732,17 @@ def _write_html_summary(out_dir: Path, report: Dict):
             rows.append(f"<tr><td>{cls}</td><td>{data.get('internal_rate',0):.3f}</td><td>{data.get('external_rate',0):.3f}</td><td>{data.get('threshold_rec','-')}</td></tr>")
         if not rows:
             rows.append('<tr><td colspan="4">No comparative data</td></tr>')
-        html = f"""<html><head><meta charset='utf-8'><title>CADI AI Evaluation Summary</title><style>body{{font-family:Arial;margin:20px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ccc;padding:6px;font-size:14px}}th{{background:#f5f5f5}}</style></head><body><h1>CADI AI Evaluation Summary</h1><p><b>Timestamp (UTC):</b> {report.get('timestamp_utc')}</p><p><b>Weights:</b> {report.get('weights')}</p><p><b>External Validation Used:</b> {report.get('external_val_used')} ({report.get('external_val_path')})</p><h2>Per-Class Comparison</h2><table><thead><tr><th>Class</th><th>Internal Rate</th><th>External Rate</th><th>Threshold (rec)</th></tr></thead><tbody>{''.join(rows)}</tbody></table><h2>Recommendations</h2><ul>{''.join(f'<li>{r}</li>' for r in report.get('recommendations', []))}</ul></body></html>"""
+        imeta = report.get('internal_meta') or {}
+        emeta = report.get('external_meta') or {}
+        meta_html = ''
+        if imeta or emeta:
+            meta_html = '<h2>Meta Statistics</h2><table><thead><tr><th>Scope</th><th>Images Scanned</th><th>Images With Target Labels</th><th>Object Instances</th></tr></thead><tbody>'
+            if imeta:
+                meta_html += f"<tr><td>Internal</td><td>{imeta.get('num_images_scanned','-')}</td><td>{imeta.get('num_images_with_target_labels','-')}</td><td>{imeta.get('object_instances_processed','-')}</td></tr>"
+            if emeta:
+                meta_html += f"<tr><td>External</td><td>{emeta.get('num_images_scanned','-')}</td><td>{emeta.get('num_images_with_target_labels','-')}</td><td>{emeta.get('object_instances_processed','-')}</td></tr>"
+            meta_html += '</tbody></table>'
+        html = f"""<html><head><meta charset='utf-8'><title>CADI AI Evaluation Summary</title><style>body{{font-family:Arial;margin:20px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ccc;padding:6px;font-size:14px}}th{{background:#f5f5f5}}</style></head><body><h1>CADI AI Evaluation Summary</h1><p><b>Timestamp (UTC):</b> {report.get('timestamp_utc')}</p><p><b>Weights:</b> {report.get('weights')}</p><p><b>External Validation Used:</b> {report.get('external_val_used')} ({report.get('external_val_path')})</p>{meta_html}<h2>Per-Class Comparison</h2><table><thead><tr><th>Class</th><th>Internal Rate</th><th>External Rate</th><th>Threshold (rec)</th></tr></thead><tbody>{''.join(rows)}</tbody></table><h2>Recommendations</h2><ul>{''.join(f'<li>{r}</li>' for r in report.get('recommendations', []))}</ul></body></html>"""
         (out_dir / 'summary.html').write_text(html)
         log(f"HTML summary written: {out_dir / 'summary.html'}")
     except Exception as e:
@@ -725,4 +750,11 @@ def _write_html_summary(out_dir: Path, report: Dict):
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        log('FATAL: Unhandled exception in evaluation script.')
+        traceback.print_exc()
+        sys.exit(1)
