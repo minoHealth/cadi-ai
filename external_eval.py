@@ -1,39 +1,29 @@
 """Unified evaluation & diagnostics script for CADI AI YOLO models.
 
-Refactored to integrate with the training notebook pipeline and support:
+Features:
  - Environment auto-detection (Kaggle / Colab / Local)
  - Auto discovery of latest trained weights (runs/**/weights/{best,last}.pt)
- - Data / working directory resolution via config.yaml + heuristics
- - Dataset balance analysis (counts + size distributions) with resumable checkpoints
- - Per-class detection diagnostics for problematic / rare classes
- - Optional automatic selection of lowest-frequency classes when not provided
- - Anchor vs object size visualization (if anchors are available)
- - Consolidated report + plots under WORKING_DIR/eval/<timestamp>
+ - Dataset & class balance analysis with resumable checkpoints
+ - Internal + optional external (real-world) validation diagnostics
+ - Per-class detection rates, missed example harvesting
+ - Per-class confidence threshold recommendations targeting recall
+ - Side-by-side internal vs external comparison
+ - Anchor vs object size visualization (if anchors exist)
+ - HTML summary + JSON report + plots under WORKING_DIR/<eval-dir-name>/<timestamp>
 
 CLI example:
-  python external_eval.py --config config.yaml --problematic "abiotic,disease" --conf 0.2
-
-Keep code <350 lines (approx) for readability.
+    python external_eval.py --config config.yaml --external-val /path/to/real_world/val --problematic "abiotic,disease" --threshold-recall-target 0.9
 """
 
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import sys
-import time
+import argparse, json, os, sys
 from datetime import datetime
 from glob import glob
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import cv2
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import seaborn as sns
-import yaml
+import cv2, matplotlib.pyplot as plt, numpy as np, pandas as pd, seaborn as sns, yaml
 from tqdm import tqdm
 from ultralytics import YOLO
 
@@ -45,10 +35,8 @@ def log(msg: str) -> None:
 
 def detect_environment() -> str:
     cwd = os.getcwd().replace('\\', '/').lower()
-    if '/kaggle' in cwd:
-        return 'kaggle'
-    if '/content' in cwd:
-        return 'colab'
+    if '/kaggle' in cwd: return 'kaggle'
+    if '/content' in cwd: return 'colab'
     return 'local'
 
 
@@ -56,41 +44,23 @@ def load_config(config_path: Path) -> Dict:
     if not config_path.exists():
         log(f"Config file not found at {config_path}, proceeding with defaults.")
         return {}
-    with config_path.open('r') as f:
-        return yaml.safe_load(f) or {}
+    with config_path.open('r') as f: return yaml.safe_load(f) or {}
 
 
 def resolve_paths(cfg: Dict, env: str) -> Tuple[Path, Path, Path]:
-    # PROJECT_DIR: current repo root (file's parent) fallback to cwd
     project_dir = Path(cfg.get('project_dir') or Path.cwd()).resolve()
-
-    # WORKING_DIR: training outputs directory
-    working_dir = Path(
-        cfg.get('working_dir')
-        or cfg.get('output_dir')  # allow legacy naming
-        or (project_dir / 'training_outputs')
-    ).resolve()
+    working_dir = Path(cfg.get('working_dir') or cfg.get('output_dir') or (project_dir / 'training_outputs')).resolve()
     working_dir.mkdir(parents=True, exist_ok=True)
-
-    # DATASET_PATH (root) is optional; often in data.yaml already. Keep for reference.
     dataset_root = Path(cfg.get('dataset_root') or project_dir / 'dataset').resolve()
     return project_dir, working_dir, dataset_root
 
 
 def find_data_yaml(project_dir: Path, working_dir: Path, cfg: Dict) -> Path | None:
     explicit = cfg.get('data') or cfg.get('data_yaml') or cfg.get('data_path')
-    candidates = []
-    if explicit:
-        candidates.append(explicit)
-    candidates.extend([
-        project_dir / 'data.yaml',
-        working_dir / 'data.yaml',
-        Path('data.yaml'),
-    ])
+    candidates = ([explicit] if explicit else []) + [project_dir / 'data.yaml', working_dir / 'data.yaml', Path('data.yaml')]
     for c in candidates:
         p = Path(c).expanduser().resolve() if not isinstance(c, Path) else c
-        if p.exists():
-            return p
+        if p.exists(): return p
     return None
 
 
@@ -98,22 +68,16 @@ def find_latest_weights(project_dir: Path, explicit: str | None = None) -> Path 
     if explicit:
         p = Path(explicit).expanduser().resolve()
         return p if p.exists() else None
-    patterns = [
-        str(project_dir / 'runs' / '**' / 'weights' / 'best.pt'),
-        str(project_dir / 'runs' / '**' / 'weights' / 'last.pt'),
-    ]
-    candidates = []
-    for pat in patterns:
-        candidates.extend(glob(pat, recursive=True))
-    if not candidates:
-        return None
-    candidates = sorted(candidates, key=lambda p: os.path.getmtime(p), reverse=True)
-    return Path(candidates[0]).resolve()
+    pats = [project_dir / 'runs' / '**' / 'weights' / 'best.pt', project_dir / 'runs' / '**' / 'weights' / 'last.pt']
+    files: List[str] = []
+    for pat in pats: files.extend(glob(str(pat), recursive=True))
+    if not files: return None
+    files = sorted(files, key=lambda p: os.path.getmtime(p), reverse=True)
+    return Path(files[0]).resolve()
 
 
 def read_yaml(path: Path) -> Dict:
-    with path.open('r') as f:
-        return yaml.safe_load(f) or {}
+    with path.open('r') as f: return yaml.safe_load(f) or {}
 
 
 # ---------------------------- Dataset Analysis ---------------------------- #
@@ -260,16 +224,44 @@ def prediction_diagnostics(
     resume: bool = True,
     batch: int = 16,
     external_val: Path | None = None,
-) -> Dict[str, float]:
+    collect_tp_conf: bool = True,
+) -> Dict[str, Dict]:
+    """Run validation & per-image diagnostics.
+
+    If external_val is provided, create a temporary data.yaml with its val path and
+    run YOLO validation into an isolated subfolder under the evaluation output dir.
+    """
     data_cfg = read_yaml(data_yaml)
     class_names = data_cfg.get('names') or []
     idx_lookup = {c: i for i, c in enumerate(class_names)}
     indices = [idx_lookup[c] for c in target_classes if c in idx_lookup]
 
-    # Run a validation pass to produce confusion matrix, etc.
+    # Prepare validation YAML (original or external override)
+    val_yaml_for_metrics = data_yaml
+    eval_name = 'internal_val'
+    if external_val is not None:
+        # Build a temp yaml referencing external validation directory only for val
+        temp_yaml = output_dir / 'external_val_data.yaml'
+        ext_cfg = dict(data_cfg)  # shallow copy
+        ext_cfg['val'] = str(external_val)
+        with temp_yaml.open('w') as f:
+            yaml.safe_dump(ext_cfg, f)
+        val_yaml_for_metrics = temp_yaml
+        eval_name = 'external_val'
+        log(f"Using external validation path: {external_val}")
+
+    # Run validation pass for metrics & confusion matrix into isolated folder
     try:
-        log("Running model.val(...) for confusion matrix generation...")
-        results = model.val(data=str(data_yaml), batch=batch, conf=conf, save_json=True, verbose=False)
+        log(f"Running model.val on {eval_name} set for metrics & confusion matrix...")
+        results = model.val(
+            data=str(val_yaml_for_metrics),
+            batch=batch,
+            conf=conf,
+            save_json=True,
+            verbose=False,
+            project=str(output_dir / 'yolo_val'),
+            name=eval_name,
+        )
         if hasattr(results, 'confusion_matrix') and results.confusion_matrix is not None:
             try:
                 cm = results.confusion_matrix.matrix
@@ -277,12 +269,11 @@ def prediction_diagnostics(
             except Exception as e:
                 log(f"Could not plot confusion matrix: {e}")
     except Exception as e:
-        log(f"Validation step failed (continuing): {e}")
+        log(f"Validation step failed (continuing diagnostics): {e}")
 
-    # Determine validation source (external overrides data.yaml val)
+    # Determine validation image root for per-image miss analysis
     if external_val is not None:
         val_root = external_val
-        log(f"Using external validation path: {val_root}")
     else:
         val_path = data_cfg.get('val')
         if not val_path:
@@ -316,6 +307,7 @@ def prediction_diagnostics(
 
     success = {c: 0 for c in target_classes}
     total = {c: 0 for c in target_classes}
+    tp_conf = {c: [] for c in target_classes}
     ckpt_path = output_dir / 'prediction_checkpoint.json'
     start_idx = 0
     if resume and ckpt_path.exists():
@@ -385,6 +377,8 @@ def prediction_diagnostics(
                 iou = inter / union if union > 0 else 0
                 if iou >= min_iou and int(pcl) == gt['cid']:
                     success[cname] += 1
+                    if collect_tp_conf:
+                        tp_conf[cname].append(float(pconf))
                     detected = True
                     break
             if not detected:
@@ -417,7 +411,7 @@ def prediction_diagnostics(
     rates = {c: (success[c] / total[c]) if total[c] else 0.0 for c in target_classes}
     _plot_detection_rates(rates, output_dir, conf)
     _write_detection_summary(rates, success, total, output_dir)
-    return rates
+    return {'rates': rates, 'success': success, 'total': total, 'tp_confidences': tp_conf}
 
 
 def _save_prediction_ckpt(path: Path, success: Dict[str, int], total: Dict[str, int], processed: int):
@@ -523,6 +517,19 @@ def generate_recommendations(problematic: List[str], counts: Dict[str, int], rat
     return recs
 
 
+def recommend_thresholds(tp_confidences: Dict[str, List[float]], target_recall: float, default: float = 0.25) -> Dict[str, float]:
+    target_recall = min(max(target_recall, 0.05), 0.99)
+    out = {}
+    for cls, confs in tp_confidences.items():
+        if not confs:
+            out[cls] = default
+            continue
+        confs_sorted = sorted(confs, reverse=True)
+        k = max(1, int(len(confs_sorted) * target_recall))
+        k = min(k, len(confs_sorted))
+        out[cls] = float(confs_sorted[k - 1])
+    return out
+
 # ---------------------------- Main Orchestration ---------------------------- #
 
 def parse_args():
@@ -539,6 +546,7 @@ def parse_args():
     p.add_argument('--no-resume', action='store_true', help='Disable checkpoint resume')
     p.add_argument('--output-dir', default=None, help='Explicit output directory (otherwise auto under WORKING_DIR/eval)')
     p.add_argument('--external-val', default=None, help='External validation path (directory or list file) used only for diagnostics; does NOT modify data.yaml')
+    p.add_argument('--eval-dir-name', default='open_cadi_eval', help='Base folder name under WORKING_DIR for evaluation outputs (timestamp subfolder added)')
     return p.parse_args()
 
 
@@ -567,7 +575,8 @@ def main():
 
     # Prepare output dir
     timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    output_dir = Path(args.output_dir) if args.output_dir else (working_dir / 'eval' / timestamp)
+    base_eval_dir = args.eval_dir_name or 'open_cadi_eval'
+    output_dir = Path(args.output_dir) if args.output_dir else (working_dir / base_eval_dir / timestamp)
     output_dir.mkdir(parents=True, exist_ok=True)
     log(f"Output directory: {output_dir}")
 
@@ -585,38 +594,46 @@ def main():
     if args.problematic:
         problematic = [c.strip() for c in args.problematic.split(',') if c.strip() in all_classes]
     else:
-        # auto-pick rarest K classes
         ranked = sorted(all_classes, key=lambda c: class_counts.get(c, 0))
         problematic = ranked[: max(1, args.auto_problematic_k)]
-    if not problematic:
-        log('No valid problematic classes specified or found; aborting diagnostics step.')
-        rates = {}
-    else:
+
+    internal_diag: Dict = {}
+    external_diag: Dict = {}
+    thresholds: Dict[str, float] = {}
+    if problematic:
         log(f"Problematic classes: {problematic}")
-        external_val_path = Path(args.external_val).resolve() if args.external_val else None
-        if external_val_path and not external_val_path.exists():
-            log(f"WARNING: external validation path {external_val_path} does not exist; falling back to data.yaml val")
-            external_val_path = None
-        rates = prediction_diagnostics(
-            model,
-            data_yaml,
-            problematic,
-            output_dir,
-            conf=args.conf,
-            limit=args.limit,
-            min_iou=args.min_iou,
-            overlap_thresh=args.overlap_thresh,
-            resume=resume,
-            batch=args.batch,
-            external_val=external_val_path,
-        )
-        log('Prediction diagnostics complete.')
+        internal_diag = prediction_diagnostics(
+            model, data_yaml, problematic, output_dir / 'internal',
+            conf=args.conf, limit=args.limit, min_iou=args.min_iou,
+            overlap_thresh=args.overlap_thresh, resume=resume, batch=args.batch, external_val=None)
+        thresholds = recommend_thresholds(internal_diag['tp_confidences'], args.threshold_recall_target)
+        if args.external_val:
+            ext_path = Path(args.external_val).resolve()
+            if ext_path.exists():
+                external_diag = prediction_diagnostics(
+                    model, data_yaml, problematic, output_dir / 'external',
+                    conf=args.conf, limit=args.limit, min_iou=args.min_iou,
+                    overlap_thresh=args.overlap_thresh, resume=resume, batch=args.batch, external_val=ext_path)
+            else:
+                log(f"WARNING: external validation path {ext_path} does not exist; skipping external diagnostics.")
+        log('Prediction diagnostics complete (internal + optional external).')
+    else:
+        log('No problematic classes determined; skipping diagnostics.')
 
     # Anchor analysis
     anchor_analysis(data_yaml, class_sizes, output_dir)
 
     # Recommendations & report
-    recs = generate_recommendations(problematic, class_counts, rates) if problematic else []
+    internal_rates = internal_diag.get('rates', {}) if internal_diag else {}
+    recs = generate_recommendations(problematic, class_counts, internal_rates) if problematic else []
+    side_by_side = {}
+    if problematic and external_diag:
+        for cls in problematic:
+            side_by_side[cls] = {
+                'internal_rate': internal_diag['rates'].get(cls, 0.0),
+                'external_rate': external_diag['rates'].get(cls, 0.0),
+                'threshold_rec': thresholds.get(cls)
+            }
     report = {
         'timestamp_utc': timestamp,
         'environment': env,
@@ -627,7 +644,10 @@ def main():
         'classes': all_classes,
         'problematic_classes': problematic,
         'class_counts': class_counts,
-        'detection_rates': rates,
+        'internal_detection_rates': internal_rates,
+        'external_detection_rates': external_diag.get('rates', {}) if external_diag else {},
+        'per_class_thresholds': thresholds,
+        'side_by_side': side_by_side,
         'recommendations': recs,
         'args': vars(args),
         'external_val_used': args.external_val is not None,
@@ -638,12 +658,29 @@ def main():
 
     log('===== Summary =====')
     log(f"Problematic classes: {problematic}")
-    log(f"Detection rates: {rates}")
+    if internal_diag: log(f"Internal detection rates: {internal_diag['rates']}")
+    if external_diag: log(f"External detection rates: {external_diag['rates']}")
+    if thresholds: log(f"Per-class threshold recommendations (target recall {args.threshold_recall_target}): {thresholds}")
     if recs:
         log('Recommendations:')
         for r in recs:
             log(f" - {r}")
     log(f"Artifacts saved under: {output_dir}")
+    _write_html_summary(output_dir, report)
+
+
+def _write_html_summary(out_dir: Path, report: Dict):
+    try:
+        rows = []
+        for cls, data in report.get('side_by_side', {}).items():
+            rows.append(f"<tr><td>{cls}</td><td>{data.get('internal_rate',0):.3f}</td><td>{data.get('external_rate',0):.3f}</td><td>{data.get('threshold_rec','-')}</td></tr>")
+        if not rows:
+            rows.append('<tr><td colspan="4">No comparative data</td></tr>')
+        html = f"""<html><head><meta charset='utf-8'><title>CADI AI Evaluation Summary</title><style>body{{font-family:Arial;margin:20px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ccc;padding:6px;font-size:14px}}th{{background:#f5f5f5}}</style></head><body><h1>CADI AI Evaluation Summary</h1><p><b>Timestamp (UTC):</b> {report.get('timestamp_utc')}</p><p><b>Weights:</b> {report.get('weights')}</p><p><b>External Validation Used:</b> {report.get('external_val_used')} ({report.get('external_val_path')})</p><h2>Per-Class Comparison</h2><table><thead><tr><th>Class</th><th>Internal Rate</th><th>External Rate</th><th>Threshold (rec)</th></tr></thead><tbody>{''.join(rows)}</tbody></table><h2>Recommendations</h2><ul>{''.join(f'<li>{r}</li>' for r in report.get('recommendations', []))}</ul></body></html>"""
+        (out_dir / 'summary.html').write_text(html)
+        log(f"HTML summary written: {out_dir / 'summary.html'}")
+    except Exception as e:
+        log(f"Failed to write HTML summary: {e}")
 
 
 if __name__ == '__main__':
